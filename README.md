@@ -11,7 +11,7 @@ can optionally delete repositories after a successful archive.
 - `git` installed
 - GitHub SSH authentication configured for `git@github.com`
 - AWS credentials/profile with permission to upload to the destination bucket
-- Optional: `git-lfs` to fetch Git LFS objects
+- `git-lfs` installed, so LFS objects are included in backups and restores
 
 ## Modes
 
@@ -53,10 +53,12 @@ git clone /tmp/evaluator_service_prototype.git evaluator_service_prototype
 ```
 
 `--restore-online` first verifies that the target repository does not exist,
-creates it through the API using the saved visibility and supported repository
-settings, then pushes the full mirror using Git smart HTTP authenticated by
+downloads and validates the archive, creates the repository through the API
+using the saved visibility and supported repository settings, then pushes the
+full mirror and any LFS objects using Git smart HTTP authenticated by
 `GH_API_TOKEN`. It is separate from local `--restore` and requires
-`--organization`.
+`--organization`. If pushing the mirror or restoring settings fails, gitrub
+deletes the newly created incomplete repository as a rollback.
 
 ## Full Git backup
 
@@ -91,8 +93,11 @@ git clone evaluator_service_prototype.git restored-repository
 
 The metadata sidecar does not include issues, pull requests, releases, Actions
 history, secrets, collaborators, branch protections, webhooks, or other
-non-repository GitHub data. Git LFS objects are fetched when `git-lfs` is
-installed.
+non-repository GitHub data. Git LFS objects are fetched into the archive and
+are retained by local restores or uploaded by online restores.
+
+Bulk operations continue after an individual repository fails, then exit with
+an error that lists all failed repositories.
 
 ## Logging
 

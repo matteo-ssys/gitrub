@@ -39,6 +39,7 @@ parser.add_argument("--destination", help="Local destination path for --restore"
 
 args = parser.parse_args()
 LOG_FILE = "gitrub.log"
+ARCHIVE_CONTENTS_CACHE = {}
 
 
 def validate_arguments():
@@ -119,11 +120,28 @@ def main():
         repositories = get_repositories(args.organization, api_baseurl, headers)
 
     rows = []
+    failures = []
     for repo in repositories:
-        process_repository(repo, rows, headers, github_token, exact_selection)
+        try:
+            process_repository(repo, rows, headers, github_token, exact_selection)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            if exact_selection:
+                raise
+            failures.append((repo.get("full_name", repo.get("name", "unknown")), error))
+            print(
+                f"ERROR: failed to process {failures[-1][0]}: {error}",
+                file=sys.stderr,
+            )
 
     if args.list or args.dry_run or not rows:
         print_table(rows)
+
+    if failures:
+        failed_names = ", ".join(name for name, _ in failures)
+        raise RuntimeError(
+            f"{len(failures)} repositories failed; completed the remaining repositories: "
+            f"{failed_names}"
+        )
 
 
 def check_rate_limit(api_baseurl, headers):
@@ -207,9 +225,9 @@ def process_repository(repo, rows, headers, github_token, exact_selection):
         if args.dry_run:
             print(f"DRY RUN: would archive {repo['full_name']} to s3://{args.s3_bucket}/")
         else:
-            object_key = git_archive(repo, github_token, args.s3_bucket, args.aws_profile)
+            archive_key = git_archive(repo, github_token, args.s3_bucket, args.aws_profile)
             log_action(args.s3_bucket, repo["full_name"], "archived")
-            print(f"Uploaded s3://{args.s3_bucket}/{object_key}")
+            print(f"Uploaded s3://{args.s3_bucket}/{archive_key}")
         rows.append(row)
 
     if selected_for_delete:
@@ -239,7 +257,7 @@ def process_repository(repo, rows, headers, github_token, exact_selection):
             delete_repository(repo, headers)
             log_action(args.s3_bucket, repo["full_name"], "deleted")
             print(f"Deleted {repo['full_name']}")
-        if not rows:
+        if not selected_for_archive:
             rows.append(row)
 
 
@@ -276,6 +294,11 @@ def get_contrib(repo, headers):
 
 def git_archive(repo, github_token, destination_bucket, aws_profile):
     """Create and upload a full Git mirror archive."""
+    if not shutil.which("git-lfs"):
+        raise RuntimeError(
+            "git-lfs is required for complete backups, including repositories that use LFS"
+        )
+
     with tempfile.TemporaryDirectory(prefix="gitrub-") as workdir:
         mirror_dir = os.path.join(workdir, repo["name"] + ".git")
         archive_path = os.path.join(workdir, repo["name"] + ".tar.gz")
@@ -296,16 +319,15 @@ def git_archive(repo, github_token, destination_bucket, aws_profile):
             text=True,
         )
 
-        if shutil.which("git-lfs"):
-            subprocess.run(
-                ["git", "lfs", "fetch", "--all"],
-                check=True,
-                cwd=mirror_dir,
-                env=git_env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+        subprocess.run(
+            ["git", "lfs", "fetch", "--all"],
+            check=True,
+            cwd=mirror_dir,
+            env=git_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
         with tarfile.open(archive_path, "w:gz") as archive:
             archive.add(mirror_dir, arcname=repo["name"] + ".git")
@@ -335,16 +357,21 @@ def git_archive(repo, github_token, destination_bucket, aws_profile):
 
 def find_archive_key(repo, destination_bucket, aws_profile):
     """Find the newest dated archive for a repository in S3."""
-    aws_session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
-    s3_client = aws_session.client("s3")
     repo_name = repo["name"] if isinstance(repo, dict) else repo
     suffix = "_" + repo_name + ".tar.gz"
-    candidates = []
-    paginator = s3_client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=destination_bucket):
-        for item in page.get("Contents", []):
-            if item["Key"].endswith(suffix):
-                candidates.append(item)
+    cache_key = (aws_profile, destination_bucket)
+    if cache_key not in ARCHIVE_CONTENTS_CACHE:
+        aws_session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
+        paginator = aws_session.client("s3").get_paginator("list_objects_v2")
+        ARCHIVE_CONTENTS_CACHE[cache_key] = [
+            item
+            for page in paginator.paginate(Bucket=destination_bucket)
+            for item in page.get("Contents", [])
+        ]
+
+    candidates = [
+        item for item in ARCHIVE_CONTENTS_CACHE[cache_key] if item["Key"].endswith(suffix)
+    ]
 
     if not candidates:
         return None
@@ -377,13 +404,7 @@ def restore_repository(repo_name, destination_bucket, aws_profile, destination):
             repo_name, destination_bucket, aws_profile, Path(workdir)
         )
 
-        subprocess.run(
-            ["git", "clone", "--mirror", str(mirror_path), str(destination_path)],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        shutil.copytree(mirror_path, destination_path, symlinks=True)
 
     print(f"Restored s3://{destination_bucket}/{archive_key} to {destination_path}")
 
@@ -419,33 +440,54 @@ def restore_online_repository(
         )
         return
 
-    create_data = repository_create_payload(repo_name, repository_metadata)
-    create_response = requests.post(
-        f"https://api.github.com/orgs/{organization}/repos",
-        headers=headers,
-        json=create_data,
-        timeout=10,
-    )
-    if create_response.status_code not in (201,):
-        try:
-            message = create_response.json().get("message", create_response.text)
-        except ValueError:
-            message = create_response.text
-        raise RuntimeError(
-            f"GitHub repository creation failed for {organization}/{repo_name} "
-            f"(HTTP {create_response.status_code}): {message}"
-        )
-
-    clone_url = create_response.json()["clone_url"]
     with tempfile.TemporaryDirectory(prefix="gitrub-online-restore-") as workdir:
-        _, mirror_path = download_archive(
+        downloaded_key, mirror_path = download_archive(
             repo_name, destination_bucket, aws_profile, Path(workdir)
         )
-        push_mirror(mirror_path, clone_url, github_token)
+        if downloaded_key != archive_key:
+            raise RuntimeError(
+                f"archive selection changed during restore: {archive_key} -> {downloaded_key}"
+            )
+        if has_lfs_objects(mirror_path) and not shutil.which("git-lfs"):
+            raise RuntimeError(
+                "git-lfs is required to restore the LFS objects in this archive"
+            )
 
-    restore_repository_settings(
-        organization, repo_name, repository_metadata, headers
-    )
+        create_data = repository_create_payload(repo_name, repository_metadata)
+        create_response = requests.post(
+            f"https://api.github.com/orgs/{organization}/repos",
+            headers=headers,
+            json=create_data,
+            timeout=10,
+        )
+        if create_response.status_code != 201:
+            try:
+                message = create_response.json().get("message", create_response.text)
+            except ValueError:
+                message = create_response.text
+            raise RuntimeError(
+                f"GitHub repository creation failed for {organization}/{repo_name} "
+                f"(HTTP {create_response.status_code}): {message}"
+            )
+
+        clone_url = create_response.json()["clone_url"]
+        try:
+            push_mirror(mirror_path, clone_url, github_token)
+            restore_repository_settings(
+                organization, repo_name, repository_metadata, headers
+            )
+        except Exception as restore_error:  # pylint: disable=broad-exception-caught
+            full_name = f"{organization}/{repo_name}"
+            try:
+                delete_repository({"full_name": full_name}, headers)
+            except Exception as rollback_error:  # pylint: disable=broad-exception-caught
+                raise RuntimeError(
+                    f"online restore failed for {full_name}, and rollback deletion also "
+                    f"failed: {rollback_error}"
+                ) from restore_error
+            raise RuntimeError(
+                f"online restore failed for {full_name}; removed the incomplete repository"
+            ) from restore_error
 
     print(
         f"Restored s3://{destination_bucket}/{archive_key} to "
@@ -548,11 +590,19 @@ def download_archive(repo_name, destination_bucket, aws_profile, workdir):
             f"archive s3://{destination_bucket}/{archive_key} does not contain "
             f"the expected {repo_name}.git mirror"
         )
+    subprocess.run(
+        ["git", "fsck", "--full"],
+        check=True,
+        cwd=mirror_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
     return archive_key, mirror_path
 
 
 def push_mirror(mirror_path, clone_url, github_token):
-    """Push all refs using Git smart HTTP with a temporary askpass helper."""
+    """Push all Git refs and LFS objects using a temporary askpass helper."""
     with tempfile.NamedTemporaryFile(mode="w", prefix="gitrub-askpass-", delete=False) as helper:
         helper.write("#!/bin/sh\n")
         helper.write('case "$1" in\n')
@@ -569,8 +619,17 @@ def push_mirror(mirror_path, clone_url, github_token):
         "GIT_TERMINAL_PROMPT": "0",
     })
     try:
+        remote_name = "gitrub-restore-target"
         subprocess.run(
-            ["git", "push", "--mirror", clone_url],
+            ["git", "remote", "add", remote_name, clone_url],
+            check=True,
+            cwd=mirror_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "push", "--mirror", remote_name],
             check=True,
             cwd=mirror_path,
             env=git_env,
@@ -578,8 +637,24 @@ def push_mirror(mirror_path, clone_url, github_token):
             stderr=subprocess.PIPE,
             text=True,
         )
+        if has_lfs_objects(mirror_path):
+            subprocess.run(
+                ["git", "lfs", "push", "--all", remote_name],
+                check=True,
+                cwd=mirror_path,
+                env=git_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
     finally:
         os.unlink(helper_path)
+
+
+def has_lfs_objects(mirror_path):
+    """Return whether an archived mirror contains any Git LFS object files."""
+    objects_path = Path(mirror_path) / "lfs" / "objects"
+    return objects_path.is_dir() and any(path.is_file() for path in objects_path.rglob("*"))
 
 
 def safe_extract_tar(archive_path, destination):
