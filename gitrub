@@ -1,251 +1,631 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-# pylint: disable=bare-except, too-many-locals, line-too-long
 
 """
-gitrub - fetches a list of repos (or a single repo) from github to maintain and clean
+gitrub - inspect, archive, and optionally delete GitHub repositories.
 """
 
 import argparse
 from datetime import datetime, timezone
 import json
 import os
-import sys
 import shutil
-from subprocess import PIPE, Popen
-import requests
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
 import boto3
+from botocore.exceptions import ClientError
 from prettytable import PrettyTable
+import requests
+
 
 parser = argparse.ArgumentParser()
-parser.add_argument("-r", "--repo", help="Search for a specific repo name, list all repos if unset")
-parser.add_argument("-t", "--github-token", help="Github token required for authentication, set this or the environmental variable GH_TOKEN")
-parser.add_argument("-o", "--organization", help="User organization to elaborate")
-parser.add_argument("--archive", help="Backup a repository locally - Basically clone and zip, use --s3-bucket to upload to S3", action="store_true", default=False)
-parser.add_argument("--s3-bucket", help="S3 bucket to upload to while using the --archive option")
-parser.add_argument("-d", "--days", help="Set the number of days after of which a repo is considered 'stale'. Required to check old repos, if unset it won't fetch the repos' top contributor.", type=int)
+parser.add_argument("-r", "--repo", help="Exact repository name to inspect/archive")
+parser.add_argument("--aws-profile", help="AWS profile to use for S3 operations")
+parser.add_argument("-o", "--organization", help="GitHub organization to process")
+mode_group = parser.add_mutually_exclusive_group()
+mode_group.add_argument("-l", "--list", action="store_true", help="List repositories without archiving or deleting")
+mode_group.add_argument("-a", "--archive", action="store_true", help="Archive selected repositories to S3")
+mode_group.add_argument("--restore", action="store_true", help="Restore the newest S3 archive to a local bare Git mirror")
+mode_group.add_argument("--restore-online", action="store_true", help="Create and restore the repository on GitHub")
+parser.add_argument("--s3-bucket", help="S3 bucket for archive uploads")
+parser.add_argument("-d", "--days", type=int, help="Age threshold in days")
+parser.add_argument("--delete", action="store_true", help="Delete selected GitHub repositories; requires explicit confirmation flag")
+parser.add_argument("--dry-run", action="store_true", help="Show planned actions without uploading or deleting")
+parser.add_argument("--destination", help="Local destination path for --restore")
 
 args = parser.parse_args()
+LOG_FILE = "gitrub.log"
 
-# To do: upload to S3 once archived
+
+def validate_arguments():
+    if not args.list and not args.archive and not args.restore and not args.restore_online and not args.delete:
+        parser.error("one of --list, --archive, --restore, --restore-online, or --delete is required")
+
+    if args.list and args.delete:
+        parser.error("--list cannot be combined with --delete")
+
+    if (args.restore or args.restore_online) and args.delete:
+        parser.error("restore modes cannot be combined with --delete")
+
+    if (args.restore or args.restore_online) and not args.repo:
+        parser.error("--repo is required with restore modes")
+
+    if args.restore and not args.destination:
+        parser.error("--destination is required with --restore")
+
+    if args.archive and not args.s3_bucket:
+        parser.error("--s3-bucket is required with --archive")
+
+    if args.delete and not args.s3_bucket:
+        parser.error("--s3-bucket is required with --delete so the archive can be verified")
+
+    if (args.restore or args.restore_online) and not args.s3_bucket:
+        parser.error("--s3-bucket is required with restore modes")
+
+    if args.days is not None and args.days < 0:
+        parser.error("--days must be zero or greater")
+
+    if (args.archive or args.delete) and not args.repo and args.days is None:
+        parser.error("--days is required for bulk archive/delete operations")
+
+    if (args.restore or args.restore_online) and args.days is not None:
+        parser.error("--days cannot be used with restore modes")
+
+    if args.restore_online and not args.organization:
+        parser.error("--organization is required with --restore-online")
+
 
 def main():
+    validate_arguments()
 
-    """
-    Once authenticated to github, the script is fetching
-    a single repo or the full list of repos related one user
-    or its organization.
-    """
+    if args.restore:
+        restore_repository(args.repo, args.s3_bucket, args.aws_profile, args.destination)
+        return
 
-    github_token = ""
-
-    if args.github_token:
-        github_token = args.github_token
-    else:
-        if os.environ.get('GH_TOKEN'):
-            github_token = os.getenv('GH_TOKEN')
-        else:
-            print("No -t/--github-token arguments passed or GH_TOKEN environment variable found. Please pass the GitHub token by setting the argument or the environment variable")
-            sys.exit(1)
+    github_token = os.getenv("GH_API_TOKEN")
+    if not github_token:
+        print("GH_API_TOKEN environment variable not found. Please set it before running gitrub")
+        sys.exit(1)
 
     headers = {
-        "Authorization": "token " + github_token,
-        "Accept": "application/vnd.github+json"
+        "Authorization": "Bearer " + github_token,
+        "Accept": "application/vnd.github+json",
     }
-
     api_baseurl = "https://api.github.com/"
+    check_rate_limit(api_baseurl, headers)
 
-    # Check Github API rates before continuing
-    rates = (requests.get(api_baseurl + "rate_limit", headers=headers, timeout=10)).json()
+    if args.restore_online:
+        restore_online_repository(
+            args.repo,
+            args.organization,
+            args.s3_bucket,
+            args.aws_profile,
+            headers,
+            github_token,
+            args.dry_run,
+        )
+        return
+
+    exact_selection = bool(args.repo)
+    if args.repo:
+        user = get_authenticated_user(api_baseurl, headers)
+        owner = args.organization or user
+        repositories = [get_repo_by_name(owner, args.repo, api_baseurl, headers)]
+    else:
+        repositories = get_repositories(args.organization, api_baseurl, headers)
+
+    rows = []
+    for repo in repositories:
+        process_repository(repo, rows, headers, github_token, exact_selection)
+
+    if args.list or args.dry_run or not rows:
+        print_table(rows)
+
+
+def check_rate_limit(api_baseurl, headers):
+    response = requests.get(api_baseurl + "rate_limit", headers=headers, timeout=10)
+    response.raise_for_status()
     try:
+        rates = response.json()
         remaining = rates["resources"]["core"]["remaining"]
-        reset = datetime.fromtimestamp(rates["resources"]["core"]["reset"]).strftime('%c')
-        if remaining < 20:
-            print(f"WARNING: only {str(remaining)} remaining API calls, will reset at {str(reset)}")
-        elif remaining == 0:
-            print(f"ERROR: no API calls last, will reset at {str(reset)}")
+        reset = datetime.fromtimestamp(rates["resources"]["core"]["reset"]).strftime("%c")
+        if remaining == 0:
+            print(f"ERROR: no API calls left, will reset at {reset}")
             sys.exit(1)
-    except:
+        if remaining < 20:
+            print(f"WARNING: only {remaining} API calls remaining, will reset at {reset}")
+    except (KeyError, TypeError, ValueError):
         print("Error while checking current API call rates. Check your authentication is still valid")
         sys.exit(1)
 
-    repos = []
-    user = (requests.get(api_baseurl + "user", headers=headers, timeout=10)).json()["login"]
 
-    if args.repo:
+def get_authenticated_user(api_baseurl, headers):
+    response = requests.get(api_baseurl + "user", headers=headers, timeout=10)
+    response.raise_for_status()
+    return response.json()["login"]
 
-        if args.organization:
-            api_url = api_baseurl + 'repos/' + args.organization + '/' + args.repo
-        else:
-            api_url = api_baseurl + 'repos/' + user + '/' + args.repo
 
-        repo = (requests.get(api_url, headers=headers, timeout=10)).json()
+def get_repo_by_name(owner, name, api_baseurl, headers):
+    response = requests.get(
+        api_baseurl + "repos/" + owner + "/" + name,
+        headers=headers,
+        timeout=10,
+    )
+    if response.status_code == 404:
+        print("Repository not found, please check if it actually exists")
+        sys.exit(1)
+    response.raise_for_status()
+    return response.json()
 
-        if "message" in repo:
-            if repo["message"] == "Not Found":
-                print("Repository not found, please check if it actually exists")
-        else:
-            last_update = get_last_update(repo)
-            updated = ""
-            repo['description'] = ""
-            repo['stale'] = "False"
-            main_contributor = ""
 
-            if last_update:
-                updated = last_update[0]
-                if args.days:
-                    if last_update[1] > args.days:
-                        repo['stale'] = "True"
-            else:
-                updated = "NotAvailable"
-
-            if repo['description']:
-                repo['description'] = (repo['description'][:50] + '..') if len(repo['description']) > 50 else repo['description']
-
-            if args.days:
-                main_contributor = get_contrib(repo, headers)
-
-            if args.archive:
-                git_archive(repo, github_token, args.s3_bucket)
-
-            exit()
-
-            repos.append(repo['name'] + '$' + repo['description'] + '$' + updated + "$" + main_contributor + "$" + repo['stale'])
+def get_repositories(organization, api_baseurl, headers):
+    params = {"per_page": 100}
+    if organization:
+        api_url = api_baseurl + "orgs/" + organization + "/repos"
     else:
+        api_url = api_baseurl + "user/repos"
+        params["type"] = "owner"
 
-        params = {'per_page' : 100}
-        another_page = True
+    repositories = []
+    while api_url:
+        response = requests.get(api_url, params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+        page = response.json()
+        if not isinstance(page, list):
+            raise RuntimeError(f"Unexpected GitHub repository response: {page}")
+        repositories.extend(page)
+        api_url = response.links.get("next", {}).get("url")
+        params = None
+    return repositories
 
-        if args.organization:
-            api_url = api_baseurl + 'orgs/' + args.organization + '/repos'
+
+def process_repository(repo, rows, headers, github_token, exact_selection):
+    last_update = get_last_update(repo)
+    stale = bool(args.days is not None and last_update and last_update[1] > args.days)
+    description = repo.get("description") or ""
+    description = (description[:80] + "..") if len(description) > 80 else description
+    row = [repo["name"], description, last_update[0] if last_update else "NotAvailable", "", str(stale)]
+
+    if args.list:
+        if stale:
+            row[3] = get_contrib(repo, headers)
+        rows.append(row)
+        return
+
+    if exact_selection:
+        selected_for_archive = args.archive
+        selected_for_delete = args.delete
+    else:
+        selected_for_archive = args.archive and repo.get("archived", False) and stale
+        selected_for_delete = args.delete and repo.get("archived", False) and stale
+
+    if selected_for_archive:
+        if args.dry_run:
+            print(f"DRY RUN: would archive {repo['full_name']} to s3://{args.s3_bucket}/")
         else:
-            api_url = api_baseurl + 'user/repos'
-            params['type'] = "owner"
+            object_key = git_archive(repo, github_token, args.s3_bucket, args.aws_profile)
+            log_action(args.s3_bucket, repo["full_name"], "archived")
+            print(f"Uploaded s3://{args.s3_bucket}/{object_key}")
+        rows.append(row)
 
-        orgs_repos = []
-
-        while another_page:
-            github_response = requests.get(api_url, params=params, headers=headers, timeout=10)
-            json_response = json.loads(github_response.text)
-            orgs_repos.append(json_response)
-
-            if 'next' in github_response.links:
-                api_url = github_response.links['next']['url']
+    if selected_for_delete:
+        if args.dry_run:
+            if not selected_for_archive:
+                archive_key = find_archive_key(repo, args.s3_bucket, args.aws_profile)
+                if not archive_key:
+                    raise RuntimeError(
+                        f"refusing delete of {repo['full_name']}: no matching archive found "
+                        f"in s3://{args.s3_bucket}"
+                    )
+                print(f"DRY RUN: verified existing archive s3://{args.s3_bucket}/{archive_key}")
             else:
-                another_page=False
-
-        for page in orgs_repos:
-            for repo in page:
-                last_update = get_last_update(repo)
-                repo['stale'] = "False"
-                if last_update:
-                    updated = last_update[0]
-                    if args.days:
-                        if last_update[1] > args.days:
-                            repo['stale'] = "True"
-                else:
-                    updated = "NotAvailable"
-
-                # Truncate if description is too long
-                if repo['description']:
-                    repo['description'] = (repo['description'][:80] + '..') if len(repo['description']) > 80 else repo['description']
-                else:
-                    repo['description'] = ""
-
-                # Actions for stale repos
-                main_contributor = ""
-                if repo['stale'] == "True":
-                    main_contributor = get_contrib(repo, headers)
-
-                repos.append(repo['name'] + '$' + repo['description'] + '$' + updated + "$" + main_contributor + "$" + repo['stale'])
-
-    pt_headers = ["Repo", "Description", "LastPush", "MainContributor", "Stale"]
-
-    pt_table = PrettyTable(pt_headers)
-    pt_table.align = "l"
-
-    for repo_det in repos:
-        pt_table.add_row(repo_det.split("$"))
-
-    print(pt_table.get_string(sortby="LastPush"))
+                print("DRY RUN: would verify the uploaded S3 archive before deletion")
+            print(f"DRY RUN: would delete {repo['full_name']}")
+        else:
+            archive_key = archive_key if selected_for_archive else find_archive_key(
+                repo, args.s3_bucket, args.aws_profile
+            )
+            if not archive_key:
+                raise RuntimeError(
+                    f"refusing delete of {repo['full_name']}: no matching archive found "
+                    f"in s3://{args.s3_bucket}"
+                )
+            verify_archive_exists(args.s3_bucket, archive_key, args.aws_profile)
+            print(f"Verified archive s3://{args.s3_bucket}/{archive_key}")
+            delete_repository(repo, headers)
+            log_action(args.s3_bucket, repo["full_name"], "deleted")
+            print(f"Deleted {repo['full_name']}")
+        if not rows:
+            rows.append(row)
 
 
 def get_last_update(repo):
+    dates = []
+    for field in ("pushed_at", "updated_at"):
+        try:
+            dates.append(datetime.strptime(repo[field], "%Y-%m-%dT%H:%M:%SZ"))
+        except (KeyError, TypeError, ValueError):
+            pass
 
-    """
-    From the repo object returned from an github API call
-    it returns a list with the latest update to the repo
-    and the number of days from it as an integer.
-    The date returned is the most recent evaluated between
-    the values pushed_at and updated_at
-    """
+    if not dates:
+        return None
 
-    try:
-        last_push = datetime.strptime(repo['pushed_at'], '%Y-%m-%dT%H:%M:%SZ')
-    except:
-        last_push = None
-
-    try:
-        last_update = datetime.strptime(repo['updated_at'], '%Y-%m-%dT%H:%M:%SZ')
-    except:
-        last_update = None
-
-    if last_push and last_update:
-
-        last_change = last_update
-
-        if last_push > last_update:
-            last_change = last_push
-
-        stale_repo_days = (datetime.now(timezone.utc) - last_change.replace(tzinfo=timezone.utc)).days
-
-        return [last_change.strftime('%Y-%m-%d %H:%M'), stale_repo_days]
-
-    return ["-", None]
+    last_change = max(dates)
+    stale_repo_days = (datetime.now(timezone.utc) - last_change.replace(tzinfo=timezone.utc)).days
+    return [last_change.strftime("%Y-%m-%d %H:%M"), stale_repo_days]
 
 
 def get_contrib(repo, headers):
-
-    """
-    From the repo object returned from an github API call
-    it returns the github username with the highest number
-    of updates to the repo.
-    """
-
-    params = {'per_page': 1}
-
     try:
-        api_url = "https://api.github.com/repos/" + repo["full_name"] + "/contributors"
-        contrib = (requests.get(api_url, params=params, headers=headers, timeout=10)).json()
-        return contrib[0]['login']
-    except:
+        response = requests.get(
+            "https://api.github.com/repos/" + repo["full_name"] + "/contributors",
+            params={"per_page": 1},
+            headers=headers,
+            timeout=10,
+        )
+        response.raise_for_status()
+        contributors = response.json()
+        return contributors[0]["login"] if contributors else "notfound"
+    except (KeyError, IndexError, requests.RequestException, TypeError):
         return "notfound"
 
 
-def git_archive(repo, github_token, destination_bucket):
+def git_archive(repo, github_token, destination_bucket, aws_profile):
+    """Create and upload a full Git mirror archive."""
+    with tempfile.TemporaryDirectory(prefix="gitrub-") as workdir:
+        mirror_dir = os.path.join(workdir, repo["name"] + ".git")
+        archive_path = os.path.join(workdir, repo["name"] + ".tar.gz")
+        git_env = os.environ.copy()
+        git_env.update({
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.extraHeader",
+            "GIT_CONFIG_VALUE_0": "Authorization: Bearer " + github_token,
+            "GIT_TERMINAL_PROMPT": "0",
+        })
 
-    """
-    Clone a git repo, zip it and delete the clone folder
-    """
+        subprocess.run(
+            ["git", "clone", "--mirror", repo["ssh_url"], mirror_dir],
+            check=True,
+            env=git_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
-    # Set the URL to use the GitHub token to clone
-    repo_url = repo["clone_url"].replace("https://", f"https://{github_token}@")
+        if shutil.which("git-lfs"):
+            subprocess.run(
+                ["git", "lfs", "fetch", "--all"],
+                check=True,
+                cwd=mirror_dir,
+                env=git_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
 
-    # Clone the repo into a folder with the same name
-    with Popen("git clone " + repo_url + " " + repo["name"], stdout=PIPE, stderr=PIPE, shell=True) as process:
-        process.communicate()[0].decode("utf-8")
+        with tarfile.open(archive_path, "w:gz") as archive:
+            archive.add(mirror_dir, arcname=repo["name"] + ".git")
 
-    # ZIP the whole folder (zipfile, 'zip', folder_to_archive)
-    shutil.make_archive(repo["name"], 'zip', repo["name"])
+        aws_session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
+        archived_at = datetime.now(timezone.utc)
+        object_key = archived_at.strftime("%Y-%m-%d") + "_" + repo["name"] + ".tar.gz"
+        metadata_key = object_key.removesuffix(".tar.gz") + ".json"
+        s3_client = aws_session.client("s3")
+        s3_client.upload_file(archive_path, destination_bucket, object_key)
+        s3_client.put_object(
+            Bucket=destination_bucket,
+            Key=metadata_key,
+            Body=json.dumps(
+                {
+                    "schema_version": 1,
+                    "archived_at": archived_at.isoformat(),
+                    "repository": repo,
+                },
+                indent=2,
+                sort_keys=True,
+            ).encode("utf-8"),
+            ContentType="application/json",
+        )
+        return object_key
 
-    if destination_bucket:
-        # Upload the zip file on S3
-        s3_res = boto3.resource('s3')
-        s3_res.Bucket(destination_bucket).upload_file(f"{repo['name']}.zip", f"github_backup/{repo['name']}.zip")
 
-    # Delete the zip file and the cloned directory
-    shutil.rmtree(repo["name"])
+def find_archive_key(repo, destination_bucket, aws_profile):
+    """Find the newest dated archive for a repository in S3."""
+    aws_session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
+    s3_client = aws_session.client("s3")
+    repo_name = repo["name"] if isinstance(repo, dict) else repo
+    suffix = "_" + repo_name + ".tar.gz"
+    candidates = []
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=destination_bucket):
+        for item in page.get("Contents", []):
+            if item["Key"].endswith(suffix):
+                candidates.append(item)
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item["LastModified"])["Key"]
 
 
-if __name__ == '__main__':
-    main()
+def verify_archive_exists(destination_bucket, object_key, aws_profile):
+    aws_session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
+    try:
+        aws_session.client("s3").head_object(Bucket=destination_bucket, Key=object_key)
+    except ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code")
+        if error_code in ("404", "NoSuchKey", "NotFound"):
+            raise RuntimeError(
+                f"archive s3://{destination_bucket}/{object_key} does not exist"
+            ) from error
+        raise RuntimeError(
+            f"unable to verify archive s3://{destination_bucket}/{object_key}: {error}"
+        ) from error
+
+
+def restore_repository(repo_name, destination_bucket, aws_profile, destination):
+    """Download the newest archive and restore it as a bare Git mirror."""
+    destination_path = Path(destination).expanduser()
+    if destination_path.exists():
+        raise RuntimeError(f"restore destination already exists: {destination_path}")
+
+    with tempfile.TemporaryDirectory(prefix="gitrub-restore-") as workdir:
+        archive_key, mirror_path = download_archive(
+            repo_name, destination_bucket, aws_profile, Path(workdir)
+        )
+
+        subprocess.run(
+            ["git", "clone", "--mirror", str(mirror_path), str(destination_path)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    print(f"Restored s3://{destination_bucket}/{archive_key} to {destination_path}")
+
+
+def restore_online_repository(
+    repo_name, organization, destination_bucket, aws_profile, headers, github_token, dry_run
+):
+    """Create a GitHub repository from its S3 archive and metadata."""
+    archive_key = find_archive_key(repo_name, destination_bucket, aws_profile)
+    if not archive_key:
+        raise RuntimeError(
+            f"no archive found for {repo_name} in s3://{destination_bucket}"
+        )
+    verify_archive_exists(destination_bucket, archive_key, aws_profile)
+    metadata = load_metadata(destination_bucket, archive_key, aws_profile)
+    repository_metadata = metadata.get("repository", {})
+
+    repository_api_url = f"https://api.github.com/repos/{organization}/{repo_name}"
+    existing = requests.get(repository_api_url, headers=headers, timeout=10)
+    if existing.status_code != 404:
+        if existing.status_code == 200:
+            raise RuntimeError(
+                f"refusing online restore: GitHub repository already exists: "
+                f"{organization}/{repo_name}"
+            )
+        existing.raise_for_status()
+
+    if dry_run:
+        print(
+            f"DRY RUN: would create GitHub repository {organization}/{repo_name} "
+            f"(visibility={repository_metadata.get('visibility', 'private')}) "
+            f"and push s3://{destination_bucket}/{archive_key}"
+        )
+        return
+
+    create_data = repository_create_payload(repo_name, repository_metadata)
+    create_response = requests.post(
+        f"https://api.github.com/orgs/{organization}/repos",
+        headers=headers,
+        json=create_data,
+        timeout=10,
+    )
+    if create_response.status_code not in (201,):
+        try:
+            message = create_response.json().get("message", create_response.text)
+        except ValueError:
+            message = create_response.text
+        raise RuntimeError(
+            f"GitHub repository creation failed for {organization}/{repo_name} "
+            f"(HTTP {create_response.status_code}): {message}"
+        )
+
+    clone_url = create_response.json()["clone_url"]
+    with tempfile.TemporaryDirectory(prefix="gitrub-online-restore-") as workdir:
+        _, mirror_path = download_archive(
+            repo_name, destination_bucket, aws_profile, Path(workdir)
+        )
+        push_mirror(mirror_path, clone_url, github_token)
+
+    restore_repository_settings(
+        organization, repo_name, repository_metadata, headers
+    )
+
+    print(
+        f"Restored s3://{destination_bucket}/{archive_key} to "
+        f"https://github.com/{organization}/{repo_name}"
+    )
+
+
+def load_metadata(destination_bucket, archive_key, aws_profile):
+    metadata_key = archive_key.removesuffix(".tar.gz") + ".json"
+    aws_session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
+    try:
+        response = aws_session.client("s3").get_object(
+            Bucket=destination_bucket, Key=metadata_key
+        )
+    except ClientError as error:
+        error_code = error.response.get("Error", {}).get("Code")
+        if error_code in ("404", "NoSuchKey", "NotFound"):
+            raise RuntimeError(
+                f"metadata s3://{destination_bucket}/{metadata_key} does not exist"
+            ) from error
+        raise RuntimeError(
+            f"unable to read metadata s3://{destination_bucket}/{metadata_key}: {error}"
+        ) from error
+
+    try:
+        metadata = json.loads(response["Body"].read().decode("utf-8"))
+    except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"metadata s3://{destination_bucket}/{metadata_key} is invalid JSON"
+        ) from error
+    if metadata.get("schema_version") != 1 or not metadata.get("repository"):
+        raise RuntimeError(
+            f"metadata s3://{destination_bucket}/{metadata_key} has an unsupported format"
+        )
+    return metadata
+
+
+def repository_create_payload(repo_name, repository_metadata):
+    payload = {"name": repo_name}
+    for field in (
+        "description",
+        "homepage",
+        "private",
+        "has_issues",
+        "has_projects",
+        "has_wiki",
+        "is_template",
+        "has_discussions",
+        "visibility",
+        "custom_properties",
+    ):
+        if field in repository_metadata and repository_metadata[field] is not None:
+            payload[field] = repository_metadata[field]
+    payload.setdefault("private", True)
+    return payload
+
+
+def restore_repository_settings(organization, repo_name, repository_metadata, headers):
+    repository_url = f"https://api.github.com/repos/{organization}/{repo_name}"
+    topics = repository_metadata.get("topics")
+    if topics:
+        response = requests.put(
+            repository_url + "/topics",
+            headers=headers,
+            json={"names": topics},
+            timeout=10,
+        )
+        response.raise_for_status()
+
+    patch = {}
+    if repository_metadata.get("default_branch"):
+        patch["default_branch"] = repository_metadata["default_branch"]
+    if repository_metadata.get("archived"):
+        patch["archived"] = True
+    if patch:
+        response = requests.patch(
+            repository_url, headers=headers, json=patch, timeout=10
+        )
+        response.raise_for_status()
+
+
+def download_archive(repo_name, destination_bucket, aws_profile, workdir):
+    archive_key = find_archive_key(repo_name, destination_bucket, aws_profile)
+    if not archive_key:
+        raise RuntimeError(
+            f"no archive found for {repo_name} in s3://{destination_bucket}"
+        )
+    verify_archive_exists(destination_bucket, archive_key, aws_profile)
+
+    archive_path = workdir / "archive.tar.gz"
+    extracted_path = workdir / "extracted"
+    extracted_path.mkdir()
+    aws_session = boto3.Session(profile_name=aws_profile) if aws_profile else boto3.Session()
+    aws_session.client("s3").download_file(destination_bucket, archive_key, str(archive_path))
+    safe_extract_tar(archive_path, extracted_path)
+
+    mirror_path = extracted_path / (repo_name + ".git")
+    if not mirror_path.is_dir():
+        raise RuntimeError(
+            f"archive s3://{destination_bucket}/{archive_key} does not contain "
+            f"the expected {repo_name}.git mirror"
+        )
+    return archive_key, mirror_path
+
+
+def push_mirror(mirror_path, clone_url, github_token):
+    """Push all refs using Git smart HTTP with a temporary askpass helper."""
+    with tempfile.NamedTemporaryFile(mode="w", prefix="gitrub-askpass-", delete=False) as helper:
+        helper.write("#!/bin/sh\n")
+        helper.write('case "$1" in\n')
+        helper.write('*Username*) printf "%s\\n" "x-access-token" ;;\n')
+        helper.write('*) printf "%s\\n" "$GIT_ASKPASS_TOKEN" ;;\n')
+        helper.write("esac\n")
+        helper_path = helper.name
+
+    os.chmod(helper_path, 0o700)
+    git_env = os.environ.copy()
+    git_env.update({
+        "GIT_ASKPASS": helper_path,
+        "GIT_ASKPASS_TOKEN": github_token,
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    try:
+        subprocess.run(
+            ["git", "push", "--mirror", clone_url],
+            check=True,
+            cwd=mirror_path,
+            env=git_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    finally:
+        os.unlink(helper_path)
+
+
+def safe_extract_tar(archive_path, destination):
+    destination_root = destination.resolve()
+    with tarfile.open(archive_path, "r:gz") as archive:
+        for member in archive.getmembers():
+            member_path = (destination / member.name).resolve()
+            if os.path.commonpath((str(destination_root), str(member_path))) != str(destination_root):
+                raise RuntimeError(f"unsafe path in archive: {member.name}")
+        archive.extractall(destination, filter="data")
+
+
+def delete_repository(repo, headers):
+    response = requests.delete(
+        "https://api.github.com/repos/" + repo["full_name"],
+        headers=headers,
+        timeout=10,
+    )
+    if response.status_code != 204:
+        try:
+            message = response.json().get("message", response.text)
+        except ValueError:
+            message = response.text
+        raise RuntimeError(
+            f"GitHub refused deletion of {repo['full_name']} "
+            f"(HTTP {response.status_code}): {message}"
+        )
+
+
+def log_action(bucket, repository, action):
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with open(LOG_FILE, "a", encoding="utf-8") as log_file:
+        log_file.write(f"{timestamp} {bucket} {repository} {action}\n")
+
+
+def print_table(rows):
+    table = PrettyTable(["Repo", "Description", "LastPush", "MainContributor", "Stale"])
+    table.align = "l"
+    for row in rows:
+        table.add_row(row)
+    print(table.get_string(sortby="LastPush"))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RuntimeError as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        sys.exit(1)
